@@ -1,0 +1,25 @@
+name: Sync Fork with Upstream
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    if: github.event.repository.fork
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main # 【注意】如果是 master 分支，改这里
+
+      - name: Sync Upstream
+        uses: aormsby/fork-sync-with-upstream-action@v3.4.3
+        with:
+          upstream_sync_repo: Lee-xeo/Claude-Cage
+          upstream_sync_branch: main # 【注意】如果是 master 分支，改这里
+          target_sync_branch: main # 【注意】如果是 master 分支，改这里
+          target_repo_token: ${{ secrets.GITHUB_TOKEN }}
+          # sync_tags: true  # 如果原项目有版本 Tag 需要同步，取消这行注释
