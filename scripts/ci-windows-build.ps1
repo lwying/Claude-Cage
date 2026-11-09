@@ -29,21 +29,6 @@ try {
         } elseif (-not $env:CAGE_WINDOWS_PFX_BASE64 -or -not $env:CAGE_WINDOWS_PFX_PASSWORD) {
             throw 'Configure CAGE_WINDOWS_PFX_BASE64 and CAGE_WINDOWS_PFX_PASSWORD in the cage-release environment.'
         }
-        $sourceUri = $null
-        if (-not [Uri]::TryCreate($env:CAGE_WINDOWS_QEMU_SOURCE_URL, [UriKind]::Absolute, [ref]$sourceUri) -or
-            $sourceUri.Scheme -ne 'https' -or $sourceUri.UserInfo -or $sourceUri.Query -or $sourceUri.Fragment -or
-            $env:CAGE_WINDOWS_QEMU_SOURCE_SHA256 -notmatch '^[0-9A-Fa-f]{64}$') {
-            throw 'Configure CAGE_WINDOWS_QEMU_SOURCE_URL (HTTPS) and CAGE_WINDOWS_QEMU_SOURCE_SHA256 for the reviewed complete source archive.'
-        }
-        $extension = [IO.Path]::GetExtension($sourceUri.AbsolutePath).ToLowerInvariant()
-        if ($extension -notin @('.zip', '.7z', '.tar', '.gz', '.xz', '.bz2', '.zst')) {
-            throw 'The reviewed source URL must name a ZIP, 7z, tar or compressed tar archive.'
-        }
-        $qemuSource = Join-Path $env:RUNNER_TEMP ('qemu-windows-source-' + [guid]::NewGuid().ToString('N') + $extension)
-        Invoke-WebRequest -Uri $sourceUri -OutFile $qemuSource -TimeoutSec 600 -MaximumRedirection 5
-        if ((Get-FileHash -LiteralPath $qemuSource -Algorithm SHA256).Hash -ne $env:CAGE_WINDOWS_QEMU_SOURCE_SHA256) {
-            throw 'Reviewed corresponding-source archive checksum mismatch.'
-        }
         if ($env:CAGE_WINDOWS_SIGNING_PROVIDER -ne 'esigner') {
             $pfx = Join-Path $env:RUNNER_TEMP ('cage-signing-' + [guid]::NewGuid().ToString('N') + '.pfx')
             [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CAGE_WINDOWS_PFX_BASE64))
@@ -63,8 +48,28 @@ try {
     & (Join-Path $PSScriptRoot 'install-nsis.ps1') -Destination $env:RUNNER_TEMP
     $env:PATH = (Join-Path $env:RUNNER_TEMP 'nsis-3.13') + [IO.Path]::PathSeparator + $env:PATH
     Invoke-BuildTool 'node' @('scripts/check-version.mjs')
-    Invoke-BuildTool 'node' @('--test', 'internal/cage/browser-clipboard.test.mjs')
+    Invoke-BuildTool 'node' @('--test', 'internal/cage/browser-clipboard.test.mjs', 'scripts/windows-native-bridge.test.mjs')
+    $windowsPowerShell = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell/v1.0/powershell.exe'
+    & (Join-Path $PSScriptRoot 'test-windows-installation-files.ps1') -HelperShell $windowsPowerShell
     & (Join-Path $PSScriptRoot 'build-windows.ps1') -Release:$Release
+    if ($Release) {
+        $qemuSource = Join-Path $env:RUNNER_TEMP 'qemu-windows-full-source.tar.gz'
+        $savedMsystem, $savedChere = $env:MSYSTEM, $env:CHERE_INVOKING
+        try {
+            $env:MSYSTEM = 'UCRT64'; $env:CHERE_INVOKING = '1'
+            Invoke-BuildTool (Join-Path $env:CAGE_MSYS2_ROOT 'usr/bin/bash.exe') @('-l',
+                (Join-Path $PSScriptRoot 'bundle-qemu-sources.sh'), $repository,
+                (Join-Path $repository '_output/windows-deps/qemu-cage'), $qemuSource)
+        } finally { $env:MSYSTEM = $savedMsystem; $env:CHERE_INVOKING = $savedChere }
+    }
+    if (-not $Release) {
+        $windowsPowerShell = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell/v1.0/powershell.exe'
+        foreach ($test in @('install-guest-powershell.tests.ps1', 'windows-evaluation.tests.ps1')) {
+            Invoke-BuildTool $windowsPowerShell @('-NoProfile', '-NonInteractive', '-File', "scripts/guest-os/$test")
+        }
+        Invoke-BuildTool $windowsPowerShell @('-NoProfile', '-NonInteractive', '-File', 'scripts/guest-os/windows-powershell-media.smoke.ps1',
+            '-GuestToolsDirectory', "$repository/_output/windows-amd64/app/resources/guest-os")
+    }
     Invoke-BuildTool 'dotnet' @('run', '--project', 'desktop/windows.tests/Cage.Windows.Tests.csproj')
     Invoke-BuildTool 'go' @('test', './internal/workbench', './internal/appupdate', './internal/host', './internal/managedproxy', './internal/env', './internal/paths', './internal/mounts')
     # Exercise a second volume when the runner keeps its workspace and temp on different drives.
@@ -75,6 +80,7 @@ try {
     Invoke-BuildTool 'go' @('test', './internal/cage', '-run', 'Test(Storage|Gate|ProxyRevision|ConfigChange|JobStop|CONNECT|SOCKS|DNS|RejectHostLAN|Credentials|ProxyHostname|SafetyReport|Renew)')
     Invoke-BuildTool 'go' @('test', './internal/vm', '-run', 'Test(NetworkConfined|WindowsQEMUIdentity)')
     Invoke-BuildTool 'go' @('test', 'github.com/lima-vm/lima/v2/pkg/driver/qemu', '-run', 'Test(WindowsFirmwareArgument|WindowsPackagedFirmwareBeatsOldUserCopy|WHPXQEMU64Features|WindowsCPUResolution)$')
+    Invoke-BuildTool 'go' @('test', 'github.com/lima-vm/lima/v2/pkg/hostagent', '-run', '^TestResourceProbeCommand$')
     Invoke-BuildTool 'go' @('test', 'github.com/lima-vm/lima/v2/pkg/networks/usernet', '-run', 'TestNetstackWindowsNativeSocketPaths')
     Invoke-BuildTool 'go' @('vet', './cmd/cage', './internal/cage', './internal/workbench', './internal/appupdate', './internal/host')
     $packageArguments = @{ Release = $Release; SkipBuild = $true }
