@@ -18,6 +18,7 @@ import (
 	"github.com/sylvinus/agent-vm/internal/containerenv"
 	"github.com/sylvinus/agent-vm/internal/diagnostics"
 	"github.com/sylvinus/agent-vm/internal/guestos"
+	"github.com/sylvinus/agent-vm/internal/host"
 	"github.com/sylvinus/agent-vm/internal/hostimage"
 	"github.com/sylvinus/agent-vm/internal/managedproxy"
 )
@@ -91,7 +92,7 @@ func (s *Server) sshCommandOptions(ctx context.Context, maintenance bool, args .
 	base = append(base, args...)
 	cmd := exec.CommandContext(ctx, sshExecutable(), base...)
 	cmd.Env = sshEnvironment()
-	hideCommand(cmd)
+	host.HideCommandWindow(cmd)
 	return cmd
 }
 func (s *Server) guest(ctx context.Context, script string) ([]byte, error) {
@@ -211,6 +212,7 @@ func (s *Server) attach() error {
 	s.ready = true
 	s.mu.Unlock()
 	s.restoreProjectShares()
+	s.desktopViews.background(s.changeDesktopVisibility)
 	return nil
 }
 func (s *Server) monitor(ctx context.Context) {
@@ -271,7 +273,7 @@ func (s *Server) runCage(args ...string) error {
 		defer cancel()
 	}
 	cmd := exec.CommandContext(ctx, s.exe, args...)
-	hideCommand(cmd)
+	host.HideCommandWindow(cmd)
 	cmd.Dir = s.environmentDir()
 	if cmd.Dir == "" {
 		cmd.Dir = s.profile
@@ -307,6 +309,9 @@ func (s *Server) runCage(args ...string) error {
 	return nil
 }
 func (s *Server) startEnvironment(syncTimezone bool) error {
+	s.desktopViews.reset()
+	s.desktopStatus.invalidate()
+	defer s.desktopStatus.invalidate()
 	if err := s.requireStorageReady(); err != nil {
 		return err
 	}
@@ -480,6 +485,8 @@ func (s *Server) startEnvironment(syncTimezone bool) error {
 	return errors.New("环境已启动，但浏览器连接尚未就绪。请重试连接或查看操作详情。")
 }
 func (s *Server) stopEnvironment() (returned error) {
+	s.desktopStatus.invalidate()
+	defer s.desktopStatus.invalidate()
 	explicitStop := s.jobs.snapshot().Kind == "stop"
 	defer func() {
 		if explicitStop && returned == nil {
@@ -691,12 +698,13 @@ func vmAlive(profile, workspace string) bool {
 		return false
 	}
 	var record struct {
-		PID int `json:"pid"`
+		PID     int    `json:"pid"`
+		Started string `json:"started"`
 	}
 	if json.Unmarshal(b, &record) != nil || record.PID < 1 {
 		return false
 	}
-	return processExists(record.PID)
+	return processExists(record.PID) && cage.ProcessStartMatches(record.PID, record.Started)
 }
 func (s *Server) vmRunning() bool {
 	if s.windowsGuest != nil {

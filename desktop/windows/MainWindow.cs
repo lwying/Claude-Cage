@@ -17,6 +17,8 @@ internal sealed class MainWindow : Form
     private readonly AppUpdater updater;
     private int expectedPort;
     private bool controllerNeedsUpdate, allowQuit, bootstrapping, webFailed;
+    private bool completingSmoke;
+    private string smokePhase = "starting";
     private readonly CancellationTokenSource lifetime = new();
     private readonly Dictionary<string, (string[] Paths, DateTime Expires)> fileSelections = new();
 
@@ -141,7 +143,7 @@ internal sealed class MainWindow : Form
     }
     private async void Script(string script)
     {
-        if (web.CoreWebView2 == null || IsDisposed) return;
+        if (web.IsDisposed || web.CoreWebView2 == null || IsDisposed) return;
         try { await web.ExecuteScriptAsync(script); }
         catch (InvalidOperationException) { }
         catch (System.Runtime.InteropServices.COMException) { }
@@ -154,6 +156,7 @@ internal sealed class MainWindow : Form
 
     private async Task Initialize(bool recreate = false)
     {
+        smokePhase = "initializing_webview";
         retry.Enabled = false;
         try
         {
@@ -165,6 +168,7 @@ internal sealed class MainWindow : Form
             }
             var environment = await CoreWebView2Environment.CreateAsync(null, Path.Combine(Backend.Root, "webview2"));
             await web.EnsureCoreWebView2Async(environment);
+            smokePhase = "webview_initialized";
             var core = web.CoreWebView2;
             core.Settings.AreDevToolsEnabled = false; core.Settings.AreDefaultContextMenusEnabled = false;
             core.Settings.IsStatusBarEnabled = false; core.Settings.IsZoomControlEnabled = false;
@@ -189,6 +193,7 @@ internal sealed class MainWindow : Form
                 status.Hide(); web.Show(); web.Focus(); PublishVisibility();
             };
             await core.AddScriptToExecuteOnDocumentCreatedAsync(BridgeScript);
+            if (Program.SmokeOutput != null) await core.AddScriptToExecuteOnDocumentCreatedAsync(SmokeDiagnosticsScript);
             webFailed = false;
             await Bootstrap();
         }
@@ -203,20 +208,73 @@ internal sealed class MainWindow : Form
 
     private async Task SmokeDeadline()
     {
-        try { await Task.Delay(TimeSpan.FromSeconds(120), lifetime.Token); allowQuit = true; Close(); }
+        try { await Task.Delay(TimeSpan.FromSeconds(120), lifetime.Token); await CompleteSmoke(false, "工作台未在自检期限内确认就绪"); }
         catch (OperationCanceledException) { }
     }
 
-    private async Task CompleteSmoke()
+    private async Task CompleteSmoke(bool nativeBridgeReady = true, string? failure = null)
     {
-        if (Program.SmokeOutput == null) return;
+        if (Program.SmokeOutput == null || completingSmoke) return;
+        completingSmoke = true;
+        JsonElement? page = null;
+        var pageURL = web.Source?.GetLeftPart(UriPartial.Path);
+        var environment = web.CoreWebView2?.Environment;
+        var webviewVersion = environment?.BrowserVersionString;
+        using var shutdown = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
+        shutdown.CancelAfter(TimeSpan.FromSeconds(20));
+        var errors = new List<string>();
+        int? prepareExit = null;
+        string? prepareStatus = null;
+        if (failure != null) errors.Add(failure);
         try
         {
-            var (exit, data) = await Backend.Json(["prepare-update", "--json"], lifetime.Token);
-            if (exit != 0 || data.Text("status") != "prepared") throw new IOException("自检结束时无法确认后台已停止");
+            if (!nativeBridgeReady && web.CoreWebView2 != null)
+            {
+                try
+                {
+                    var snapshot = await web.CoreWebView2.ExecuteScriptAsync("({title:document.title,ready:document.readyState,text:(document.body?.innerText||'').slice(0,4096),errors:window.__cageSmokeErrors||[]})");
+                    page = JsonDocument.Parse(snapshot).RootElement.Clone();
+                    await using var capture = File.Create(Path.ChangeExtension(Program.SmokeOutput, ".png"));
+                    await web.CoreWebView2.CapturePreviewAsync(CoreWebView2CapturePreviewImageFormat.Png, capture);
+                }
+                catch (Exception error) { errors.Add("无法保存工作台画面：" + error.Message); }
+            }
+            var controllers = Backend.CaptureSmokeControllers();
+            try
+            {
+                if (nativeBridgeReady) smokePhase = "stopping_backend";
+                var (exit, data) = await Backend.Json(["prepare-update", "--json"], shutdown.Token, TimeSpan.FromSeconds(20));
+                prepareExit = exit;
+                prepareStatus = data.Text("status") is "prepared" or "stop_required" or "error" ? data.Text("status") : "unexpected";
+                if (exit != 0 || data.Text("status") != "prepared") throw new IOException("自检结束时无法确认后台已停止");
+                await Task.WhenAll(controllers.Select(process => process.WaitForExitAsync(shutdown.Token)));
+            }
+            finally { foreach (var process in controllers) process.Dispose(); }
+        }
+        catch (Exception error) { errors.Add(error.Message); }
+        // WebView2 releases its processes asynchronously after Dispose. Its
+        // browser can retain the app's working directory until this event.
+        if (environment != null)
+        {
+            var exited = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            void BrowserExited(object? sender, CoreWebView2BrowserProcessExitedEventArgs args) => exited.TrySetResult();
+            environment.BrowserProcessExited += BrowserExited;
+            try
+            {
+                if (nativeBridgeReady && errors.Count == 0) smokePhase = "stopping_browser";
+                web.Dispose();
+                await exited.Task.WaitAsync(shutdown.Token);
+            }
+            catch (Exception error) { errors.Add("自检浏览器尚未退出：" + error.Message); }
+            finally { environment.BrowserProcessExited -= BrowserExited; }
+        }
+        try
+        {
+            if (nativeBridgeReady && errors.Count == 0) smokePhase = "completed";
             File.WriteAllText(Program.SmokeOutput, JsonSerializer.Serialize(new {
-                success = true, nativeBridgeReady = true, version = AppUpdater.Version,
-                webviewVersion = web.CoreWebView2.Environment.BrowserVersionString,
+                success = nativeBridgeReady && errors.Count == 0, nativeBridgeReady, version = AppUpdater.Version,
+                phase = smokePhase, nativeStatus = message.Text, prepareExit, prepareStatus, errors, page,
+                pageURL, webviewVersion,
                 windowBounds = Bounds, workingArea = Screen.FromHandle(Handle).WorkingArea, deviceDpi = DeviceDpi,
                 nativeMenuBar = MainMenuStrip != null,
             }));
@@ -233,7 +291,9 @@ internal sealed class MainWindow : Form
         retry.Hide(); existing.Hide(); complete.Hide();
         try
         {
+            smokePhase = "starting_backend";
             var (exit, data) = await Backend.Json(["desktop", "--json", ..options], lifetime.Token);
+            smokePhase = "backend_returned";
             if (exit != 0) throw new IOException(data.Text("message") is { Length: > 0 } detail ? detail : "工作台未能启动");
             controllerNeedsUpdate = data.Text("status") != "ready";
             if (data.Text("status") == "upgrade_pending")
@@ -241,6 +301,7 @@ internal sealed class MainWindow : Form
                 message.Text = data.Text("message"); existing.Show(); complete.Show(); return;
             }
             var entry = UpdatePolicy.Entry(data.Text("url")); expectedPort = entry.Port;
+            smokePhase = "loading_workbench";
             Text = controllerNeedsUpdate ? "Cage（更新待完成）" : "Cage";
             web.CoreWebView2.Navigate(entry.AbsoluteUri);
         }
@@ -451,14 +512,50 @@ internal sealed class MainWindow : Form
                 case "quitNow": result = true; allowQuit = true; BeginInvoke(Close); break;
                 default: throw new InvalidDataException("未知原生操作");
             }
-            web.CoreWebView2.PostWebMessageAsJson(JsonSerializer.Serialize(new { id, result }));
+            if (!web.IsDisposed) web.CoreWebView2.PostWebMessageAsJson(JsonSerializer.Serialize(new { id, result }));
         }
         catch (Exception error)
         {
             _ = Backend.Report(error.ToString());
-            if (id.Length != 0 && !IsDisposed) web.CoreWebView2.PostWebMessageAsJson(JsonSerializer.Serialize(new { id, error = error.Message }));
+            if (id.Length != 0 && !IsDisposed && !web.IsDisposed) web.CoreWebView2.PostWebMessageAsJson(JsonSerializer.Serialize(new { id, error = error.Message }));
         }
     }
+
+    private const string SmokeDiagnosticsScript = """
+        (() => {
+          if (window !== window.top || location.protocol !== 'http:' || location.hostname !== 'localhost') return;
+          const errors = [];
+          Object.defineProperty(window, '__cageSmokeErrors', { value: errors });
+          const ownPath = value => {
+            try { const url = new URL(value, location.href); return url.origin === location.origin ? url.pathname : ''; }
+            catch { return ''; }
+          };
+          const scrub = value => {
+            let text = String(value || '');
+            for (const input of document.querySelectorAll('input,textarea'))
+              if (input.value) text = text.split(input.value).join('[form-value]');
+            return text.replace(/https?:\/\/[^\s"'<>`]+/g, value => ownPath(value) || '[external]')
+              .replace(/[?#][^\s"'<>)]*/g, '[redacted]').slice(0, 768);
+          };
+          const stack = error => String(error?.stack || '').split('\n').slice(1)
+            .filter(line => line.includes(location.origin + '/')).slice(0, 6).map(scrub);
+          const record = value => { if (errors.length < 8) errors.push(value); };
+          addEventListener('error', event => {
+            if (event.target instanceof HTMLScriptElement || event.target instanceof HTMLLinkElement) {
+              const source = ownPath(event.target.src || event.target.href);
+              if (source) record({ type: 'module-load', source });
+              return;
+            }
+            const source = ownPath(event.filename || location.href);
+            if (source) record({ type: 'error', source, message: scrub(event.message), stack: stack(event.error) });
+          }, true);
+          addEventListener('unhandledrejection', event => {
+            const frames = stack(event.reason);
+            // Primitive/cross-origin rejections are counted without exporting arbitrary values.
+            record({ type: 'unhandledrejection', message: frames.length ? scrub(event.reason?.message) : 'Unhandled rejection', stack: frames });
+          });
+        })();
+        """;
 
     private const string BridgeScript = """
         (() => {

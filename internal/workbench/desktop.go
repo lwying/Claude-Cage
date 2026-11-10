@@ -243,7 +243,12 @@ func desktopLaunch(profile string, gateway bool, options DesktopOptions, start f
 // PrepareUpdate is shared by the explicit migration button and the installer.
 // It returns only after the old service has released its profile lock.
 func PrepareUpdate(configPath string, stop bool) (DesktopResult, error) {
-	c, err := connectController(filepath.Dir(configPath))
+	// A closing controller stops accepting requests before releasing its lock.
+	// Use the same bounded retirement wait as desktop startup; the lock and VM
+	// checks below still decide whether replacing the application is safe.
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	c, err := waitControllerReady(ctx, filepath.Dir(configPath))
 	if errors.Is(err, errControllerUnavailable) {
 		lock, lockErr := openControllerLock(filepath.Dir(configPath), os.O_RDWR)
 		if lockErr == nil {
@@ -271,15 +276,35 @@ func PrepareUpdate(configPath string, stop bool) (DesktopResult, error) {
 		return DesktopResult{Status: "prepared"}, nil
 	}
 	if c.launch.Controller.Protocol == controlProtocol {
-		status, err := c.call("POST", "/api/handoff", map[string]string{"token": c.record.Token}, nil)
-		if err != nil {
-			return DesktopResult{}, err
-		}
-		if status == http.StatusOK {
-			if err = c.waitForExit(); err != nil {
+		// Routine status probes also hold the operation lock. Retry briefly.
+		// every request still checks running jobs, terminals and VM ownership.
+		handoffCtx, cancelHandoff := context.WithTimeout(ctx, 3*time.Second)
+		defer cancelHandoff()
+		conflicted := false
+	handoff:
+		for {
+			status, err := c.callContext(handoffCtx, "POST", "/api/handoff", map[string]string{"token": c.record.Token}, nil)
+			if err != nil {
+				if conflicted && handoffCtx.Err() != nil {
+					break
+				}
 				return DesktopResult{}, err
 			}
-			return DesktopResult{Status: "prepared"}, nil
+			if status == http.StatusOK {
+				if err = c.waitForExit(); err != nil {
+					return DesktopResult{}, err
+				}
+				return DesktopResult{Status: "prepared"}, nil
+			}
+			if status != http.StatusConflict {
+				break
+			}
+			conflicted = true
+			select {
+			case <-handoffCtx.Done():
+				break handoff
+			case <-time.After(50 * time.Millisecond):
+			}
 		}
 	}
 	return DesktopResult{Status: "stop_required", Message: "请保存文件后确认停止环境并安装更新。终端任务会结束，项目和登录状态会保留。"}, nil

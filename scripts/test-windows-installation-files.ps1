@@ -1,5 +1,5 @@
 ﻿#requires -Version 5.1
-param([string]$HelperShell = (Get-Process -Id $PID).Path)
+param([string]$HelperShell = (Get-Process -Id $PID).Path, [switch]$InstallerSmoke)
 $ErrorActionPreference = 'Stop'
 $helper = Join-Path $PSScriptRoot '../packaging/windows/installation-files.ps1'
 $root = Join-Path ([IO.Path]::GetTempPath()) ('cage-install-files-' + [guid]::NewGuid().ToString('N'))
@@ -44,10 +44,21 @@ function App([string]$Path, [string]$Version) {
     })
     @{version = 1; files = $files} | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $Path 'Cage.install-files.json')
 }
-function Invoke-Helper([string[]]$Arguments, [int]$Expected = 0) {
+function Invoke-Helper([string[]]$Arguments, [int]$Expected = 0, [switch]$WithoutFileHash) {
+    $entry = $helper
+    if ($WithoutFileHash) {
+        $entry = Join-Path $root 'helper-without-filehash.ps1'
+        Write-File $entry @'
+$ErrorActionPreference = 'Stop'
+function global:Get-FileHash { throw [Management.Automation.CommandNotFoundException]::new('Get-FileHash is intentionally unavailable in this native helper fixture.') }
+$remaining = @($args | Select-Object -Skip 1)
+& $args[0] @remaining
+'@
+        $Arguments = @($helper) + $Arguments
+    }
     try {
         $ErrorActionPreference = 'Continue'
-        $output = & $HelperShell -NoProfile -File $helper @Arguments 2>&1 | Out-String
+        $output = & $HelperShell -NoProfile -File $entry @Arguments 2>&1 | Out-String
     } finally { $ErrorActionPreference = 'Stop' }
     if ($LASTEXITCODE -ne $Expected) { throw "Helper returned $LASTEXITCODE, expected $Expected. $output" }
 }
@@ -62,7 +73,89 @@ function Commit([string]$Old, [string]$Stage, [string]$Receipt) {
     Invoke-Helper @('-Operation','cleanup','-Source',$backup,'-Target',$Old,'-Receipt',$Receipt)
     return $backup
 }
+function Test-InstallerTransaction {
+    if (!$windows -or $PSVersionTable.PSVersion.Major -lt 7) { throw 'The optional NSIS fixture requires PowerShell 7 on a disposable Windows user.' }
+    $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\ClaudeCage'
+    $desktop = Join-Path ([Environment]::GetFolderPath('DesktopDirectory')) 'Cage.lnk'
+    $menu = Join-Path ([Environment]::GetFolderPath('Programs')) 'Cage'
+    if ((Test-Path $key) -or (Test-Path -LiteralPath $desktop) -or (Test-Path -LiteralPath $menu)) { throw 'The NSIS fixture refuses an existing Cage registration or shortcuts.' }
+    $runtime = $false
+    foreach ($hive in @([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryHive]::CurrentUser)) {
+        $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey($hive, [Microsoft.Win32.RegistryView]::Registry32)
+        $client = $base.OpenSubKey('SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}')
+        try { if ($client -and [string]$client.GetValue('pv') -notin @('','0.0.0.0')) { $runtime = $true } }
+        finally { if ($client) { $client.Dispose() }; $base.Dispose() }
+    }
+    if (!$runtime) { Write-Output 'SKIP: quick NSIS transaction needs an existing WebView2 runtime; full installer acceptance is still required.'; return }
+    $scenario = Join-Path $root 'nsis-transaction'; $app = Join-Path $scenario 'payload'; $target = Join-Path $scenario 'empty target'
+    $setup = Join-Path $scenario 'fixture-setup.exe'
+    $reportBase = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { [IO.Path]::GetTempPath() }
+    $report = Join-Path $reportBase ('cage-smoke-installation-fixture-' + [guid]::NewGuid().ToString('N') + '.json')
+    Write-File (Join-Path $app 'LICENSE.txt') 'Compile-only text payload; no Cage application or VM.'
+    App $app 'fixture'
+    $version = (Get-Content (Join-Path $PSScriptRoot '../VERSION') -Raw).Trim()
+    & (Get-Command makensis.exe -ErrorAction Stop).Source /V2 /INPUTCHARSET UTF8 "/DAPP_DIR=$app" "/DVERSION=$version" "/DVERSION_NUMERIC=$(($version -split '-')[0]).0" "/DFILE_MANIFEST=$app\Cage.install-files.json" "/DOUTPUT_FILE=$setup" (Join-Path $PSScriptRoot '../packaging/windows/Cage.nsi')
+    if ($LASTEXITCODE -ne 0) { throw 'The production NSIS fixture did not compile.' }
+    function Run-Fixture([string]$Executable, [string[]]$Arguments) {
+        $process = Start-Process -FilePath $Executable -ArgumentList $Arguments -PassThru
+        try {
+            if (!$process.WaitForExit(30000)) { $process.Kill($true); $process.WaitForExit(); throw 'The owned NSIS fixture exceeded 30 seconds.' }
+            if ($process.ExitCode -ne 0) {
+                foreach ($path in @($report, "$report.helper.json", "$report.uninstall.json", "$report.uninstall.json.helper.json")) {
+                    if ((Test-Path -LiteralPath $path) -and (Get-Item -LiteralPath $path).Length -le 8192) { Write-Output ('Quick NSIS diagnostic: ' + (Get-Content -LiteralPath $path -Raw)) }
+                }
+                throw "The NSIS fixture returned $($process.ExitCode)."
+            }
+        } finally { $process.Dispose() }
+    }
+    try {
+        [IO.Directory]::CreateDirectory($target) | Out-Null
+        Run-Fixture $setup @('/S','/DESKTOPSHORTCUT=0','/STARTMENUSHORTCUT=0',"/DIAGNOSTICS=`"$report`"","/D=$target")
+        Check ((Get-Content (Join-Path $target 'program.txt') -Raw) -eq 'fixture') 'NSIS did not publish its text payload.'
+        Check (!(Test-Path -LiteralPath ($target + '.cage-installation.json'))) 'NSIS left the first-install receipt unfinished.'
+        Check ((Get-ItemProperty $key).InstallLocation -eq $target) 'NSIS registered a different fixture target.'
+    } finally {
+        if (Test-Path $key) {
+            if ((Get-ItemProperty $key).InstallLocation -ne $target) { throw 'NSIS fixture registration changed owner; retained for inspection.' }
+            Run-Fixture (Join-Path $target 'Uninstall.exe') @('/S',('/DIAGNOSTICS="' + $report + '.uninstall.json"'))
+            # NSIS can return from its bootstrapper while the TEMP worker is
+            # still running. Its helper removes the target before NSIS clears
+            # registration and shortcuts, so target disappearance is not done.
+            $deadline = [DateTime]::UtcNow.AddSeconds(120)
+            while (((Test-Path -LiteralPath $target) -or (Test-Path $key) -or (Test-Path -LiteralPath $desktop) -or (Test-Path -LiteralPath $menu)) -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 100 }
+        }
+    }
+    $remaining = @{target = (Test-Path -LiteralPath $target); registration = (Test-Path $key); desktopShortcut = (Test-Path -LiteralPath $desktop); startMenu = (Test-Path -LiteralPath $menu)}
+    if ($remaining.Values -contains $true) {
+        foreach ($path in @("$report.uninstall.json", "$report.uninstall.json.helper.json")) {
+            if ((Test-Path -LiteralPath $path) -and (Get-Item -LiteralPath $path).Length -le 8192) { Write-Output ('Quick NSIS uninstall diagnostic: ' + (Get-Content -LiteralPath $path -Raw)) }
+        }
+    }
+    Check (!($remaining.Values -contains $true)) ('NSIS fixture did not finish uninstalling owned artifacts: ' + ($remaining | ConvertTo-Json -Compress))
+    Write-Output 'PASS: production NSIS silently installed/uninstalled its text-only fixture through PowerShell 5.1 transactions; no application or VM was started.'
+}
 try {
+    if ($InstallerSmoke) { Test-InstallerTransaction }
+    # A new install has no backup path or existing ownership manifest.
+    $scenario = Join-Path $root 'first-install'
+    $old = Join-Path $scenario 'empty-destination'; $stage = Join-Path $scenario 'staged'; $receipt = Join-Path $scenario 'receipt.json'
+    [IO.Directory]::CreateDirectory($old) | Out-Null
+    App $stage 'fresh'
+    Invoke-Helper @('-Operation','prepare','-Source',$old,'-Target',$stage,'-Receipt',$receipt)
+    $transfer = Get-Content -LiteralPath $receipt -Raw | ConvertFrom-Json
+    Check (!$transfer.backupPath -and @($transfer.moves).Count -eq 0) 'First install invented a backup or personal file transfer.'
+    [IO.Directory]::Delete($old); [IO.Directory]::Move($stage, $old)
+    Invoke-Helper @('-Operation','complete','-Target',$old,'-Receipt',$receipt) -WithoutFileHash
+    Check (!(Test-Path -LiteralPath $receipt)) 'First install did not finish its transaction.'
+
+    $diagnostic = Join-Path $scenario 'diagnostic.json'
+    Write-File (Join-Path $old 'Cage.install-files.json') 'invalid-private-manifest'
+    Invoke-Helper @('-Operation','prepare','-Target',$old,'-Receipt',$receipt,'-Diagnostics',$diagnostic) 1
+    $text = Get-Content -LiteralPath $diagnostic -Raw
+    $failure = $text | ConvertFrom-Json
+    Check ($failure.operation -eq 'prepare' -and $failure.phase -eq 'reading_new_manifest' -and @($failure.errors).Count -gt 0) 'Helper omitted its safe failure classification.'
+    Check (!$text.Contains($root) -and !$text.Contains('invalid-private-manifest') -and !$text.Contains('message')) 'Helper diagnostic contains file paths or private error text.'
+
     foreach ($manifestState in @('current','missing','invalid')) {
         $scenario = Join-Path $root $manifestState
         $old = Join-Path $scenario 'installed'; $stage = Join-Path $scenario 'staged'; $receipt = Join-Path $scenario 'receipt.json'

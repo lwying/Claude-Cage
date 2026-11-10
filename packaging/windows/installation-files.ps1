@@ -7,9 +7,30 @@ param(
     [string]$Receipt,
     [string]$Manifest,
     [string]$Backup,
+    [string]$Diagnostics,
     [switch]$LegacyTarget
 )
 $ErrorActionPreference = 'Stop'
+$diagnosticStep = 'initializing'
+trap {
+    $failure = $_
+    if ($Diagnostics) {
+        try {
+          if (!(Test-Path -LiteralPath $Diagnostics)) {
+            $chain = @()
+            $exception = $failure.Exception
+            for ($index = 0; $exception -and $index -lt 4; $index++) {
+                $chain += @{type = $exception.GetType().FullName; hresult = $exception.HResult}
+                $exception = $exception.InnerException
+            }
+            $lines = @([regex]::Matches($failure.ScriptStackTrace, ': line (\d+)') | ForEach-Object { [int]$_.Groups[1].Value })
+            @{operation = $Operation; phase = $diagnosticStep; pointerSize = [IntPtr]::Size; errors = $chain; lines = $lines; category = [string]$failure.CategoryInfo.Category} | ConvertTo-Json -Depth 4 |
+                Set-Content -LiteralPath $Diagnostics -Encoding UTF8
+          }
+        } catch { }
+    }
+    throw $failure
+}
 $manifestName = 'Cage.install-files.json'
 $identityName = 'Cage.install-id'
 
@@ -130,7 +151,8 @@ function Complete-Transfer {
         $relative = if ($entry.state -eq 'moved') { $entry.destination } else { $entry.path }
         if (!(Get-Item -LiteralPath (Join-Path $Target $relative) -Force -ErrorAction SilentlyContinue)) { throw ('个人文件尚未恢复，事务回执已保留：' + $relative) }
     }
-    $hash = (Get-FileHash -LiteralPath $Receipt -Algorithm SHA256).Hash
+    $receiptStream = Open-ReadLocked $Receipt
+    try { $hash = Stream-Hash $receiptStream } finally { $receiptStream.Dispose() }
     Remove-MatchingFile (Split-Path $Receipt -Parent) (Split-Path $Receipt -Leaf) $hash
     if (Test-Path -LiteralPath $Receipt) { throw '安装回执在完成期间发生变化，已保留待核对。' }
 }
@@ -144,6 +166,7 @@ foreach ($rootPath in @($Target, $Source)) {
     }
 }
 if ($Operation -eq 'prepare') {
+    $diagnosticStep = 'reading_new_manifest'
     if (Test-Path -LiteralPath $Receipt) { throw ('仍有未完成的安装事务，请保留并检查回执：' + $Receipt) }
     $current = Read-FileManifest (Join-Path $Target $manifestName)
     $legacySnapshot = !$current.Count -and $LegacyTarget
@@ -152,6 +175,7 @@ if ($Operation -eq 'prepare') {
         try { $current[$identityName] = Stream-Hash $identity } finally { $identity.Dispose() }
     }
     if (!$current.Count) { throw '新程序缺少有效文件清单，安装已停止。' }
+    $diagnosticStep = 'reading_new_uninstaller'
     $uninstaller = Open-ReadLocked (Join-Path $Target 'Uninstall.exe')
     try { $current['Uninstall.exe'] = Stream-Hash $uninstaller } finally { $uninstaller.Dispose() }
     $transfers = [Collections.Generic.List[object]]::new()
@@ -160,6 +184,7 @@ if ($Operation -eq 'prepare') {
     $recovery = 'Cage-preserved-files/' + [guid]::NewGuid().ToString('N')
     $programDirectories = Directory-Paths @($current.Keys)
     if ($Source -and (Test-Path -LiteralPath $Source -PathType Container)) {
+        $diagnosticStep = 'scanning_previous_installation'
         $Source = [IO.Path]::GetFullPath($Source).TrimEnd([IO.Path]::DirectorySeparatorChar)
         $previous = Read-FileManifest (Join-Path $Source $manifestName)
         $previousDirectories = Directory-Paths @($previous.Keys)
@@ -220,8 +245,10 @@ if ($Operation -eq 'prepare') {
           }
         }
     }
+    $diagnosticStep = 'writing_new_manifest'
     $files = @($current.Keys | Sort-Object | ForEach-Object { @{ path = $_; sha256 = $current[$_] } })
     @{ version = 1; files = $files } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $Target $manifestName) -Encoding UTF8
+    $diagnosticStep = 'writing_transaction_receipt'
     $record = @{kind = 'cage-installation'; version = 1; installPath = $Source; stagePath = $Target; backupPath = $Backup; files = @($transfers); directories = $directories; moves = @($moves)}
     $encoding = [Text.UTF8Encoding]::new($true)
     [byte[]]$bytes = $encoding.GetPreamble() + $encoding.GetBytes(($record | ConvertTo-Json -Depth 6))
@@ -232,6 +259,7 @@ if ($Operation -eq 'prepare') {
         [IO.File]::Move($temporary, $Receipt)
     } finally { if (Test-Path -LiteralPath $temporary) { [IO.File]::Delete($temporary) } }
 } elseif ($Operation -in @('move','restore')) {
+    $diagnosticStep = 'moving_preserved_files'
     $transfer = Get-Content -LiteralPath $Receipt -Raw -Encoding UTF8 | ConvertFrom-Json
     $moves = @($transfer.moves)
     if ($Operation -eq 'restore') { [Array]::Reverse($moves) }
@@ -263,6 +291,7 @@ if ($Operation -eq 'prepare') {
         Write-Output ('同名修改或旧程序文件已保留在 ' + (Join-Path $Target 'Cage-preserved-files'))
     }
 } elseif ($Operation -eq 'cleanup') {
+    $diagnosticStep = 'verifying_previous_file_ownership'
     $transfer = Get-Content -LiteralPath $Receipt -Raw -Encoding UTF8 | ConvertFrom-Json
     $actual = @(Read-Tree $Source @($transfer.files.path) | Where-Object { !($_.Attributes -band [IO.FileAttributes]::ReparsePoint) } | ForEach-Object { Relative-Path $Source $_.FullName })
     foreach ($entry in $transfer.files) {
@@ -284,14 +313,17 @@ if ($Operation -eq 'prepare') {
     } else { [IO.Directory]::Delete($Source) }
     Complete-Transfer
 } elseif ($Operation -eq 'complete') {
+    $diagnosticStep = 'completing_transaction_receipt'
     Complete-Transfer
 } else {
     # The payload list comes from this uninstaller's embedded build manifest.
+    $diagnosticStep = 'reading_uninstall_manifest'
     $owned = Read-FileManifest $Manifest
     if (!$owned.Count) { throw '卸载文件清单无效，原文件已保留。' }
     $installed = Read-FileManifest (Join-Path $Target $manifestName)
     if ($installed.ContainsKey('Uninstall.exe')) { $owned['Uninstall.exe'] = $installed['Uninstall.exe'] }
     $actual = @(Read-Tree $Target @($owned.Keys) | Where-Object { !($_.Attributes -band [IO.FileAttributes]::ReparsePoint) } | ForEach-Object { Relative-Path $Target $_.FullName })
+    $diagnosticStep = 'deleting_verified_program_files'
     foreach ($relative in $owned.Keys) {
         if ($relative -ne $identityName -and $relative -in $actual) { Remove-MatchingFile $Target $relative $owned[$relative] }
     }
@@ -305,6 +337,7 @@ if ($Operation -eq 'prepare') {
         $directory = Split-Path $relative -Parent
         while ($directory) { $directories += $directory.Replace('\', '/'); $directory = Split-Path $directory -Parent }
     }
+    $diagnosticStep = 'removing_program_directories'
     Remove-EmptyDirectories $Target $directories
     # A retained identity lets a later installation reuse this data-bearing folder.
     $remaining = @(Get-ChildItem -LiteralPath $Target -Force | Where-Object Name -ne $identityName)

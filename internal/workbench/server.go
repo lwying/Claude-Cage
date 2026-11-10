@@ -42,6 +42,9 @@ type controlFile struct {
 	Controller ControllerIdentity `json:"controller"`
 }
 type Server struct {
+	desktopViews                                     desktopViewDemand
+	desktopDisplayUpdate                             func(bool) error
+	desktopStatus                                    desktopStatusCache
 	agentNativeQueue                                 agentNativeQueue
 	macSetupProjectsChecked                          time.Time
 	macSetupProjectsAttempt                          time.Time
@@ -381,6 +384,7 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("POST /api/account/{action}", s.accountAction)
 	mux.HandleFunc("GET /api/settings", s.getSettings)
 	mux.HandleFunc("POST /api/projects/open", s.openProject)
+	mux.HandleFunc("POST /api/projects/remove", s.removeProject)
 	mux.HandleFunc("POST /api/projects/client-share", s.guestClientShare)
 	mux.HandleFunc("GET /api/projects/client-share", s.guestClientShare)
 	mux.HandleFunc("GET /api/environment/versions", s.environmentVersions)

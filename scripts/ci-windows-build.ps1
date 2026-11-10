@@ -13,6 +13,8 @@ $certificates = @()
 $qemuSource = $null
 $savedPath = $env:PATH
 $savedCertificate = $env:CAGE_WINDOWS_CERT_SHA1
+$savedStorageVolume = $env:CAGE_TEST_STORAGE_VOLUME
+$storageTestRoot = $null
 try {
     $actual = (& git rev-parse HEAD).Trim()
     if ($LASTEXITCODE -ne 0 -or $actual -ne $env:CAGE_BUILD_REF) { throw 'Checkout differs from the requested commit.' }
@@ -49,19 +51,16 @@ try {
     $env:PATH = (Join-Path $env:RUNNER_TEMP 'nsis-3.13') + [IO.Path]::PathSeparator + $env:PATH
     Invoke-BuildTool 'node' @('scripts/check-version.mjs')
     Invoke-BuildTool 'node' @('--test', 'internal/cage/browser-clipboard.test.mjs', 'scripts/windows-native-bridge.test.mjs')
+    Invoke-BuildTool (Get-BuildCommand @('pwsh.exe', 'pwsh')) @('-NoProfile', '-NonInteractive', '-File', 'scripts/windows-workbench-smoke.test.ps1')
     $windowsPowerShell = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell/v1.0/powershell.exe'
-    & (Join-Path $PSScriptRoot 'test-windows-installation-files.ps1') -HelperShell $windowsPowerShell
-    & (Join-Path $PSScriptRoot 'build-windows.ps1') -Release:$Release
+    # NSIS is x86 and resolves $SYSDIR to SysWOW64. Match its real helper host.
+    $installationPowerShell = Join-Path $env:SystemRoot 'SysWOW64/WindowsPowerShell/v1.0/powershell.exe'
+    & (Join-Path $PSScriptRoot 'test-windows-installation-files.ps1') -HelperShell $installationPowerShell -InstallerSmoke
     if ($Release) {
-        $qemuSource = Join-Path $env:RUNNER_TEMP 'qemu-windows-full-source.tar.gz'
-        $savedMsystem, $savedChere = $env:MSYSTEM, $env:CHERE_INVOKING
-        try {
-            $env:MSYSTEM = 'UCRT64'; $env:CHERE_INVOKING = '1'
-            Invoke-BuildTool (Join-Path $env:CAGE_MSYS2_ROOT 'usr/bin/bash.exe') @('-l',
-                (Join-Path $PSScriptRoot 'bundle-qemu-sources.sh'), $repository,
-                (Join-Path $repository '_output/windows-deps/qemu-cage'), $qemuSource)
-        } finally { $env:MSYSTEM = $savedMsystem; $env:CHERE_INVOKING = $savedChere }
+        & (Join-Path $PSScriptRoot 'prepare-qemu-release.ps1')
+        $qemuSource = Join-Path $repository '_output/windows-qemu-sources/full-source.tar.gz'
     }
+    & (Join-Path $PSScriptRoot 'build-windows.ps1') -Release:$Release
     if (-not $Release) {
         $windowsPowerShell = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell/v1.0/powershell.exe'
         foreach ($test in @('install-guest-powershell.tests.ps1', 'windows-evaluation.tests.ps1')) {
@@ -71,18 +70,28 @@ try {
             '-GuestToolsDirectory', "$repository/_output/windows-amd64/app/resources/guest-os")
     }
     Invoke-BuildTool 'dotnet' @('run', '--project', 'desktop/windows.tests/Cage.Windows.Tests.csproj')
-    Invoke-BuildTool 'go' @('test', './internal/workbench', './internal/appupdate', './internal/host', './internal/managedproxy', './internal/env', './internal/paths', './internal/mounts')
-    # Exercise a second volume when the runner keeps its workspace and temp on different drives.
-    if ($env:GITHUB_WORKSPACE -and -not $env:CAGE_TEST_STORAGE_VOLUME -and
-        [IO.Path]::GetPathRoot($env:GITHUB_WORKSPACE) -ne [IO.Path]::GetPathRoot([IO.Path]::GetTempPath())) {
-        $env:CAGE_TEST_STORAGE_VOLUME = $env:GITHUB_WORKSPACE
+    # RUNNER_TEMP and the checkout share D: on hosted runners. Use a
+    # unique system-drive directory, outside user data, for the other side.
+    if (-not $env:CAGE_TEST_STORAGE_VOLUME) {
+        $systemDrive = [IO.Path]::GetPathRoot($env:SystemRoot)
+        $testDrive = [IO.Path]::GetPathRoot((Get-WindowsWorkbenchTestBase))
+        if ($systemDrive -ne $testDrive) {
+            $storageTestRoot = (New-Item -ItemType Directory -Path (Join-Path $systemDrive ('cage-storage-volume-' + [guid]::NewGuid().ToString('N')))).FullName
+            $env:CAGE_TEST_STORAGE_VOLUME = $storageTestRoot
+            Write-Host "Storage migration tests use separate drives: $testDrive -> $systemDrive"
+        } else {
+            Write-Warning 'No second test volume is configured; the cross-volume storage test will be skipped.'
+        }
     }
-    Invoke-BuildTool 'go' @('test', './internal/cage', '-run', 'Test(Storage|Gate|ProxyRevision|ConfigChange|JobStop|CONNECT|SOCKS|DNS|RejectHostLAN|Credentials|ProxyHostname|SafetyReport|Renew)')
-    Invoke-BuildTool 'go' @('test', './internal/vm', '-run', 'Test(NetworkConfined|WindowsQEMUIdentity)')
-    Invoke-BuildTool 'go' @('test', 'github.com/lima-vm/lima/v2/pkg/driver/qemu', '-run', 'Test(WindowsFirmwareArgument|WindowsPackagedFirmwareBeatsOldUserCopy|WHPXQEMU64Features|WindowsCPUResolution)$')
-    Invoke-BuildTool 'go' @('test', 'github.com/lima-vm/lima/v2/pkg/hostagent', '-run', '^TestResourceProbeCommand$')
-    Invoke-BuildTool 'go' @('test', 'github.com/lima-vm/lima/v2/pkg/networks/usernet', '-run', 'TestNetstackWindowsNativeSocketPaths')
-    Invoke-BuildTool 'go' @('vet', './cmd/cage', './internal/cage', './internal/workbench', './internal/appupdate', './internal/host')
+    Invoke-InIsolatedTestTemp {
+        Invoke-BuildTool 'go' @('test', './internal/workbench', './internal/appupdate', './internal/host', './internal/managedproxy', './internal/env', './internal/paths', './internal/mounts')
+        Invoke-BuildTool 'go' @('test', './internal/cage', '-run', 'Test(Storage|Gate|ProxyRevision|ConfigChange|JobStop|CONNECT|SOCKS|DNS|RejectHostLAN|Credentials|ProxyHostname|SafetyReport|Renew)')
+        Invoke-BuildTool 'go' @('test', './internal/vm', '-run', 'Test(NetworkConfined|WindowsQEMUIdentity)')
+        Invoke-BuildTool 'go' @('test', 'github.com/lima-vm/lima/v2/pkg/driver/qemu', '-run', 'Test(WindowsFirmwareArgument|WindowsPackagedFirmwareBeatsOldUserCopy|WHPXQEMU64Features|WindowsCPUResolution)$')
+        Invoke-BuildTool 'go' @('test', 'github.com/lima-vm/lima/v2/pkg/hostagent', '-run', '^TestResourceProbeCommand$')
+        Invoke-BuildTool 'go' @('test', 'github.com/lima-vm/lima/v2/pkg/networks/usernet', '-run', 'TestNetstackWindowsNativeSocketPaths')
+        Invoke-BuildTool 'go' @('vet', './cmd/cage', './internal/cage', './internal/workbench', './internal/appupdate', './internal/host')
+    }
     $packageArguments = @{ Release = $Release; SkipBuild = $true }
     if ($Release) { $packageArguments.QemuSourceArchive = $qemuSource }
     & (Join-Path $PSScriptRoot 'package-windows.ps1') @packageArguments
@@ -101,9 +110,11 @@ try {
             Remove-Item "Cert:\CurrentUser\My\$($imported.Thumbprint)" -Force -ErrorAction SilentlyContinue
         }
     }
-    if ($qemuSource) { Remove-Item -LiteralPath $qemuSource -Force -ErrorAction SilentlyContinue }
+    # Verified QEMU sources remain in the build cache; packaging copies them separately.
     $env:PATH = $savedPath
     $env:CAGE_WINDOWS_CERT_SHA1 = $savedCertificate
+    $env:CAGE_TEST_STORAGE_VOLUME = $savedStorageVolume
+    if ($storageTestRoot) { Remove-Item -LiteralPath $storageTestRoot -Recurse -Force -ErrorAction SilentlyContinue }
     Remove-Item Env:CAGE_ESIGNER_PASSWORD, Env:CAGE_ESIGNER_TOTP_SECRET -ErrorAction SilentlyContinue
     Pop-Location
 }

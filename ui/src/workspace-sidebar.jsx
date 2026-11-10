@@ -38,6 +38,7 @@ export function WorkspaceSidebar({
   onSessionRefresh,
   onSessionOpen,
   openingSession,
+  sessionOpenError,
   onSessionArchive,
   onSessionPin,
   onSessionRename,
@@ -135,7 +136,7 @@ export function WorkspaceSidebar({
             onClick={() => onOpenProject()}
             aria-label="添加项目"
             title="添加项目"
-            disabled={busy || !running}
+            disabled={busy}
           >
             <Plus size={15} />
           </button>
@@ -228,6 +229,7 @@ export function WorkspaceSidebar({
                       tabs={rows}
                       saved={rowMetadata}
                       openingSession={openingSession}
+                      sessionOpenError={sessionOpenError}
                       active={home || desktopOpen ? "" : active}
                       label={`${project} 的终端`}
                       busy={busy}

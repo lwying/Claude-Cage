@@ -15,6 +15,7 @@ import (
 
 	"github.com/sylvinus/agent-vm/internal/cage"
 	"github.com/sylvinus/agent-vm/internal/guestos"
+	"github.com/sylvinus/agent-vm/internal/host"
 )
 
 // Only the trusted local workbench can operate the native Mac. Each route
@@ -35,8 +36,14 @@ func macOSWorkbenchRoute(path string) bool {
 
 func macOSInstanceRunning(instanceDir string) bool {
 	data, err := os.ReadFile(filepath.Join(instanceDir, "cage-running.json"))
-	var record struct{ PID int }
-	return err == nil && json.Unmarshal(data, &record) == nil && processExists(record.PID)
+	var record struct {
+		PID     int    `json:"pid"`
+		Started string `json:"started"`
+	}
+	if err != nil || json.Unmarshal(data, &record) != nil || record.PID < 1 {
+		return false
+	}
+	return processExists(record.PID) && cage.ProcessStartMatches(record.PID, record.Started)
 }
 
 func (s *Server) macOSSSHCommand(ctx context.Context, args ...string) *exec.Cmd {
@@ -46,7 +53,7 @@ func (s *Server) macOSSSHCommand(ctx context.Context, args ...string) *exec.Cmd 
 	}
 	cmd := exec.CommandContext(ctx, sshExecutable(), append(base, args...)...)
 	cmd.Env = sshEnvironment()
-	hideCommand(cmd)
+	host.HideCommandWindow(cmd)
 	return cmd
 }
 
