@@ -9,6 +9,7 @@ import { ProxySettings } from "./proxy-settings";
 import { SetupProgress } from "./setup-progress";
 import { DiagnosticSettings } from "./diagnostics.jsx";
 import { MacOSFirstSetup } from "./macos-first-setup";
+import { InitializationProjectApproval } from "./macos-project-approval";
 import { Modal } from "./modal";
 import { SafetyMessage } from "./safety-message";
 import { needsProxySetup } from "./onboarding-state.mjs";
@@ -63,6 +64,7 @@ function Initialization({ initial, onComplete }) {
   const [details, setDetails] = useState(false);
   const [help, setHelp] = useState(false);
   const [dialog, setDialog] = useState(null);
+  const [approvalWorkspace, setApprovalWorkspace] = useState("");
   const [proxyDirty, setProxyDirty] = useState(false);
   const alive = useRef(true);
   const pollNow = useRef(null);
@@ -72,6 +74,7 @@ function Initialization({ initial, onComplete }) {
   const job = status?.job || {};
   const busy = submitting || Boolean(job.running);
   const network = networkState(status);
+  const needsProjectApproval = status?.guest_system === "macos" && status.project_errors?.some(item => item.path === status.environment_directory && item.recovery === "project-approval");
   const ready = Boolean(status?.ready && status.vm_running && !busy && !job.error && network.mode === "open");
   const confirm = options => new Promise(resolve => setDialog({ ...options, resolve }));
   const settleDialog = value => { dialog?.resolve(value); setDialog(null); };
@@ -197,8 +200,9 @@ function Initialization({ initial, onComplete }) {
     });
   }
   const failed = Boolean(job.error || error);
+  const networkPending = Boolean(status?.ready && status.vm_running && network.mode !== "open");
   const progress = job.setup_progress && { ...job, setup_progress: job.setup_progress };
-  const title = step === "system" ? "为 Cage 准备独立环境" : step === "proxy" ? "连接你的网络代理" : ready ? "Cage 已准备就绪" : failed ? "继续完成环境安装" : busy ? "正在准备你的环境" : "安装并检查客机环境";
+  const title = step === "system" ? "为 Cage 准备独立环境" : step === "proxy" ? "连接你的网络代理" : ready ? "Cage 已准备就绪" : !busy && networkPending ? "环境已启动，等待联网检查" : failed ? "继续完成环境安装" : busy ? "正在准备你的环境" : "安装并检查客机环境";
   const index = steps.findIndex(([key]) => key === step);
   return <InitializationFrame>
     <section className="initialization-content">
@@ -207,6 +211,11 @@ function Initialization({ initial, onComplete }) {
       {connectionError && <div className="initialization-notice" role="alert"><SafetyMessage message={connectionError} /><button onClick={() => pollNow.current?.()}>重新连接</button></div>}
       {!status ? <p role="status"><LoaderCircle size={18} className="spin" />正在读取安装状态…</p> : <>
         <div className="initialization-stage" key={step}>
+          {step === "install" && needsProjectApproval && <section className="initialization-notice" aria-label="默认工作区访问">
+            <p>虚拟 Mac 正在请求访问默认工作区。请在授权窗口中核对目录，再点击 Use Project。</p>
+            <p className="macos-approval-path">{status.environment_directory}</p>
+            <button type="button" disabled={!status.ready || !status.vm_running} onClick={() => setApprovalWorkspace(status.environment_directory)}>查看并授权</button>
+          </section>}
           {step === "system" && <>
             <GuestSystemPicker system={choice} onChange={setChoice} preserveOnUnmount deferMatch />
             <InitializationStorage value={storage} onChange={setStorage} disabled={busy} />
@@ -214,9 +223,9 @@ function Initialization({ initial, onComplete }) {
           {step === "proxy" && <><ProxySettings initializing status={status} onConfirm={confirm} onDirty={setProxyDirty} onApplied={async () => { setProxy(await api("/proxy")); pollNow.current?.(); }} />{choice?.clone && !needsProxySetup(null, status, proxy) && <HostCloneSummary pending={choice.pending} onChange={setChoice} />}</>}
           {step === "install" && (ready ? <div className="initialization-ready"><ShieldCheck size={36} /><h2>环境已就绪</h2><p>独立客机已安装，工具、文件和登录状态会持续保存。以后打开 Cage 可直接进入工作台。</p></div> : <>
             {progress ? <SetupProgress job={progress} onDetails={() => setDetails(true)} onStop={stop} onRetry={install} disconnected={Boolean(connectionError) || submitting} /> : <div className="initialization-operation" role="status">{busy && <LoaderCircle size={22} className="spin" />}<p>{job.message || (status.vm_running ? "请完成客机连接和网络检查。" : "准备继续原安装，已有文件和磁盘会保留。")}</p>{!busy && !job.error && <button className="primary" disabled={Boolean(connectionError)} onClick={install}>{status.ready ? "重新启动并检查" : "继续安装"}</button>}{busy && <button onClick={stop} disabled={submitting}>停止安装</button>}</div>}
-            {job.error && !progress && <div className="initialization-notice" role="alert"><SafetyMessage message={job.error} /><button className="primary" disabled={busy || Boolean(connectionError)} onClick={install}>继续安装</button></div>}
+            {job.error && !progress && <div className="initialization-notice" role="alert"><SafetyMessage message={job.error} />{!networkPending && <button className="primary" disabled={busy || Boolean(connectionError)} onClick={install}>继续安装</button>}</div>}
             {status.ready && network.mode !== "open" && !busy && <div className="initialization-network"><p>{status.network_error || status.safety?.error || "客机已经连接，请完成网络和隔离检查后进入工作台。"}</p><button className="primary" disabled={Boolean(connectionError)} onClick={checkNetwork}>运行网络与隔离检查</button></div>}
-            {(progress?.setup_progress.phase === "image" || failed) && <p>系统镜像下载使用主机代理；下载失败请检查 Clash 等主机代理软件。客机联网与开发工具使用 Cage 代理。</p>}
+            {(progress?.setup_progress.phase === "image" || (failed && !networkPending)) && <p>系统镜像和在主机上准备的 macOS 安装组件遵循主机代理设置。下载失败时，可在操作详情中查看当前文件和重试记录。客机内的联网请求使用 Cage 代理。</p>}
             <div className="initialization-recovery"><button onClick={() => setStep("proxy")} disabled={busy}>检查 Cage 代理配置</button>{!progress && <button onClick={() => setDetails(true)}>查看操作详情</button>}</div>
           </>)}
         </div>
@@ -232,6 +241,7 @@ function Initialization({ initial, onComplete }) {
       <div className="initialization-support"><button className="text-button" aria-expanded={help} onClick={() => setHelp(!help)}>日志与诊断</button>{navigation && !busy && <button className="text-button" onClick={() => navigation.open()}>只连接 SSH 主机</button>}</div>
       {help && <DiagnosticSettings />}
     </section>
+    {approvalWorkspace && <InitializationProjectApproval workspace={approvalWorkspace} jobRunning={Boolean(job.running)} onClose={() => { setApprovalWorkspace(""); pollNow.current?.(); }} />}
     {details && <Modal title="初始化操作详情" onClose={() => setDetails(false)}><div className="modal-body"><pre className="job-log">{job.log || job.message || "暂无操作记录"}</pre></div></Modal>}
     {dialog && <Modal title={dialog.title} onClose={() => settleDialog(false)} footer={<><button onClick={() => settleDialog(false)}>取消</button><button className="primary" onClick={() => settleDialog(true)}>{dialog.confirm}</button></>}><div className="modal-body"><p>{dialog.body}</p></div></Modal>}
   </InitializationFrame>;

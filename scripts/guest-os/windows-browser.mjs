@@ -102,6 +102,10 @@ export function browserExecutable() {
 // guest's browser mode, fixed executable, and Cage-owned profile.
 export function createNativeBrowserService(options = {}) {
   const mac = options.platform === "darwin";
+  // The dedicated Windows controller streams the live viewport even when a
+  // site hasn't finished downloading fonts. Playwright otherwise waits on
+  // document.fonts.ready for every screenshot, blocking the input queue too.
+  if (!mac) process.env.PW_TEST_SCREENSHOT_NO_FONTS_READY = "1";
   const directory = options.directory ?? path.join(process.env.LOCALAPPDATA || path.join(homedir(), "AppData", "Local"), "Cage", "Browser");
   const selectionFile = path.join(directory, "tabs.json");
   const uploadDirectory = path.join(directory, "Uploads");
@@ -322,24 +326,30 @@ export function createNativeBrowserService(options = {}) {
       } catch (error) { await stopCapture(tab.page); throw error; }
     }
     clearTimeout(capture.expiry);
-    capture.expiry = setTimeout(() => { void stopCapture(tab.page); }, 1500);
-    capture.expiry.unref?.();
-    const frame = capture.latest;
-    // Windows screencast preserves a damage stream at CSS resolution, but a
-    // viewport scale changes its native input surface. Capture only new damage
-    // at the context's actual device density and reuse it for static frames.
-    if (!mac && !frame.jpeg) {
-      const started = performance.now();
-      frame.jpeg = (await tab.page.screenshot({ type: "jpeg", quality: 85 })).toString("base64");
-      captureMetrics.screenshots++;
-      captureMetrics.total_ms += performance.now() - started;
+    try {
+      const frame = capture.latest;
+      // Windows screencast preserves a damage stream at CSS resolution, but a
+      // viewport scale changes its native input surface. Capture only new damage
+      // at the context's actual device density and reuse it for static frames.
+      if (!mac && !frame.jpeg) {
+        const started = performance.now();
+        frame.jpeg = (await tab.page.screenshot({ type: "jpeg", quality: 85, caret: "initial" })).toString("base64");
+        captureMetrics.screenshots++;
+        captureMetrics.total_ms += performance.now() - started;
+      }
+      if (capture.ack !== null) {
+        const sessionId = capture.ack;
+        capture.ack = null;
+        await capture.connection.send("Page.screencastFrameAck", { sessionId });
+      }
+      return frame;
+    } finally {
+      // Only time spent between requests counts as viewer inactivity.
+      if (captures.get(tab.page) === capture) {
+        capture.expiry = setTimeout(() => { void stopCapture(tab.page); }, 1500);
+        capture.expiry.unref?.();
+      }
     }
-    if (capture.ack !== null) {
-      const sessionId = capture.ack;
-      capture.ack = null;
-      await capture.connection.send("Page.screencastFrameAck", { sessionId });
-    }
-    return frame;
   }
   async function cdp(method, params = {}, sessionID) {
     if (!sessionID) return browserCDP.send(method, params);
@@ -350,25 +360,47 @@ export function createNativeBrowserService(options = {}) {
     if (method === "Target.setAutoAttach") return {};
     return session.send(method, params);
   }
+  function detachFrame(tab, frame, expected) {
+    const id = tab.frameSessions.get(frame);
+    if (!id || expected && expected !== id) return;
+    tab.frameSessions.delete(frame);
+    frameSessions.delete(frame);
+    const connection = sessions.get(id);
+    sessions.delete(id);
+    clipboard.detachSession(id);
+    // Explicit detach also releases Playwright's transport and event listeners.
+    void connection?.detach().catch(() => {});
+  }
+
   async function attachFrame(tab, frame) {
     if (frameSessions.has(frame) || frame.isDetached()) return;
+    const id = token();
+    // Navigation and frameattached can race while newCDPSession is pending.
+    frameSessions.set(frame, id);
+    tab.frameSessions.set(frame, id);
     try {
-      const connection = await tab.page.context().newCDPSession(frame), id = token();
-      frameSessions.set(frame, id); sessions.set(id, connection);
+      const connection = await tab.page.context().newCDPSession(frame);
+      if (tab.page.isClosed() || frame.isDetached() || frameSessions.get(frame) !== id) {
+        detachFrame(tab, frame, id);
+        await connection.detach().catch(() => {});
+        return;
+      }
+      sessions.set(id, connection);
       for (const method of ["Runtime.executionContextCreated", "Runtime.executionContextDestroyed", "Runtime.executionContextsCleared", "Runtime.bindingCalled", "Page.frameDetached", "Page.frameNavigated"]) {
         connection.on(method, params => clipboard.event({ sessionId: id, method, params }));
       }
       await clipboard.attach(id, tab.id);
       if (tab.copyContext) await clipboard.setContext(tab.id, tab.copyContext);
-    } catch { /* A navigation can destroy a frame while its session attaches. */ }
+    } catch { detachFrame(tab, frame, id); }
   }
   async function addPage(page, { id = token(), incognito = false, login = false, kind = "web", workspace, blocked = false } = {}) {
     if (byPage.has(page)) { const existing = byPage.get(page); await existing.ready; return existing; }
     if (tabs.size >= 100) { await page.close(); throw failure("tab_limit", "打开的标签页过多，请先关闭部分标签页"); }
-    const tab = { id, page, incognito, login, kind, workspace, blocked, document: token(), geometry: token(), title: "", copyContext: "" };
+    const tab = { id, page, incognito, login, kind, workspace, blocked, document: token(), geometry: token(), title: "", copyContext: "", frameSessions: new Map() };
     tabs.set(id, tab); byPage.set(page, tab);
     page.on("close", () => {
       void stopCapture(page);
+      for (const frame of tab.frameSessions.keys()) detachFrame(tab, frame);
       tabs.delete(id); clipboard?.detachTab(id); uploads?.cancelTab(id);
       if (active === id) invalidateCopies();
       if (vault) for (const [sid, entry] of vault.sessions) if (entry.tab === id) vault.sessions.delete(sid);
@@ -401,17 +433,19 @@ export function createNativeBrowserService(options = {}) {
     });
     page.on("frameattached", frame => { void attachFrame(tab, frame); });
     page.on("domcontentloaded", changed);
-    page.on("framedetached", frame => { const sid = frameSessions.get(frame); sessions.delete(sid); });
+    page.on("framedetached", frame => detachFrame(tab, frame));
     tab.ready = (async () => {
     // A persistent context keeps its launch viewport for newly opened pages.
     // Each tab must join the workbench's current viewport before capture starts.
     await page.setViewportSize(viewport);
     const connection = await page.context().newCDPSession(page), sid = token();
+    if (page.isClosed()) { await connection.detach().catch(() => {}); return; }
+    tab.session = sid; sessions.set(sid, connection); frameSessions.set(page.mainFrame(), sid);
+    tab.frameSessions.set(page.mainFrame(), sid);
     // Playwright enables focus emulation for every page. Native input proofs
     // must observe the real selected document and native Chrome UI focus.
     if (!mac && !(options.testing === true && options.headless !== false)) await connection.send("Emulation.setFocusEmulationEnabled", { enabled: false });
     tab.browserContextId = (await connection.send("Target.getTargetInfo")).targetInfo.browserContextId;
-    tab.session = sid; sessions.set(sid, connection); frameSessions.set(page.mainFrame(), sid);
     tab.nativeTarget = (await connection.send("Target.getTargetInfo")).targetInfo.targetId;
     for (const method of ["Runtime.executionContextCreated", "Runtime.executionContextDestroyed", "Runtime.executionContextsCleared", "Runtime.bindingCalled", "Page.frameDetached", "Page.frameNavigated"]) {
       connection.on(method, params => { clipboard.event({ sessionId: sid, method, params }); vault?.event({ sessionId: sid, method, params }); });
@@ -475,8 +509,10 @@ export function createNativeBrowserService(options = {}) {
           chromiumSandbox: true, viewport, deviceScaleFactor: displayScale, acceptDownloads: true,
           ...(timezone ? { timezoneId: timezone } : {}), ...(language ? { locale: language } : {}),
           ...(networkMode === "proxy" ? { proxy: { server: proxy, bypass: proxyBypass } } : {}),
-          args: ["--disable-quic", "--no-first-run", "--no-default-browser-check", "--restore-last-session", "--disable-session-crashed-bubble", "--host-resolver-rules=MAP *.cage-editor.localhost 127.0.0.1", ...(networkMode === "packet" ? ["--no-proxy-server"] : []), ...(extensionTools ? ["--enable-unsafe-extension-debugging", `--load-extension=${splitDirectory}`] : [])],
-          ignoreDefaultArgs: [...(extensionTools ? ["--disable-extensions"] : []), ...(mac ? ["--mute-audio"] : [])], timeout: 20000,
+          // CDP transports the user's input. Preserve the native browser identity
+          // in every context, including private pages that cannot load extensions.
+          args: ["--disable-blink-features=AutomationControlled", "--disable-quic", "--no-first-run", "--no-default-browser-check", "--restore-last-session", "--disable-session-crashed-bubble", "--host-resolver-rules=MAP *.cage-editor.localhost 127.0.0.1", ...(networkMode === "packet" ? ["--no-proxy-server"] : []), ...(extensionTools ? ["--enable-unsafe-extension-debugging", `--load-extension=${splitDirectory}`] : [])],
+          ignoreDefaultArgs: ["--enable-automation", ...(extensionTools ? ["--disable-extensions"] : []), ...(mac ? ["--mute-audio"] : [])], timeout: 20000,
         });
       } catch (error) { if (error.code) throw error; throw failure("browser_unavailable", "Windows 客机图形浏览器未能启动，请检查 GUI 会话和安装组件"); }
       context.setDefaultTimeout(7000); owner = context.browser();
@@ -1006,7 +1042,11 @@ export function createNativeBrowserService(options = {}) {
     if (method === "GET") {
       if (action === "frame-proof") return nativeFrameProof();
       if (action === "focus-proof") return nativeFocusProof();
-      if (action === "health") return { ready: true, native: !options.testing, capabilities: (await snapshot()).capabilities, ...(!mac ? { capture: { ...captureMetrics } } : {}) };
+      if (action === "health") return {
+        ready: true, native: !options.testing, capabilities: (await snapshot()).capabilities,
+        resources: { tabs: tabs.size, sessions: sessions.size, clipboard_sessions: clipboard.sessions.size, captures: captures.size },
+        ...(!mac ? { capture: { ...captureMetrics } } : {}),
+      };
       if (action === "tabs") return snapshot();
       if (action === "events") {
         const after = Number.isSafeInteger(input.after) && input.after >= 0 ? input.after : 0;

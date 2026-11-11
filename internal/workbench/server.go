@@ -42,8 +42,9 @@ type controlFile struct {
 	Controller ControllerIdentity `json:"controller"`
 }
 type Server struct {
-	desktopViews                                     desktopViewDemand
+	desktopViews                                     displayViewDemand
 	desktopDisplayUpdate                             func(bool) error
+	browserViews                                     displayViewDemand
 	desktopStatus                                    desktopStatusCache
 	agentNativeQueue                                 agentNativeQueue
 	macSetupProjectsChecked                          time.Time
@@ -110,6 +111,7 @@ type Server struct {
 	recovery                                         networkRecovery
 	locations                                        map[string]Location
 	monitorCancel                                    context.CancelFunc
+	monitorSafetyOp                                  sync.Mutex
 	safetyOp                                         sync.Mutex
 	networkPaused                                    bool
 	proxyNetworkLost                                 bool
@@ -189,7 +191,7 @@ func serve(configPath string, clientOnly bool, fullConfigPath string) (returned 
 		return err
 	}
 	defer listener.Close()
-	s := &Server{profile: profile, configPath: configPath, exe: exe, clientOnly: clientOnly, origin: fmt.Sprintf("http://localhost:%d", port), token: randomToken(), session: randomToken(), preferences: Preferences{Keyboard: defaultKeyboard(), AutoTimezone: true, AutoLanguage: true}}
+	s := &Server{profile: profile, configPath: configPath, exe: exe, clientOnly: clientOnly, origin: fmt.Sprintf("http://localhost:%d", port), token: randomToken(), session: randomToken(), preferences: Preferences{Keyboard: defaultKeyboard(), AutoTimezone: true, AutoLanguage: true, BalancedDisplay: true}}
 	s.desktopEntry = fullConfigPath != ""
 	workload := !s.desktopEntry && !clientOnly
 	if s.desktopEntry {
@@ -239,6 +241,8 @@ func serve(configPath string, clientOnly bool, fullConfigPath string) (returned 
 		if b, e := os.ReadFile(filepath.Join(profile, "workbench.json")); e == nil {
 			// Existing profiles without this field used manual language settings.
 			s.preferences.AutoLanguage = false
+			// Preserve the original density of profiles saved before this setting.
+			s.preferences.BalancedDisplay = false
 			_ = json.Unmarshal(b, &s.preferences)
 		}
 		if !s.storageRecoveryStatus().Required {
@@ -475,6 +479,7 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("DELETE /api/clipboard/files/{id}", s.clipboardArchive)
 	mux.HandleFunc("POST /api/terminals", s.newTerminal)
 	mux.HandleFunc("DELETE /api/terminals/{id}", s.closeTerminal)
+	mux.HandleFunc("POST /api/terminals/{id}/login-link", s.terminalLoginLink)
 	mux.HandleFunc("POST /api/terminals/{id}/metadata", s.terminalSessionMetadata)
 	mux.HandleFunc("GET /api/terminals/{id}/stream", s.terminalStream)
 	web, _ := fs.Sub(assets, "web")
